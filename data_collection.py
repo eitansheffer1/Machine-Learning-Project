@@ -40,7 +40,7 @@ LOCATIONS: Dict[str, Tuple[float, float]] = {
     "vancouver": (49.2827, -123.1207),
 }
 
-# 10 mandatory daily variables from the project specification
+# 10 mandatory daily variables from the project specification + 2 domain-selected physical predictors
 DAILY_VARIABLES: List[str] = [
     "weather_code",
     "temperature_2m_max",
@@ -52,6 +52,8 @@ DAILY_VARIABLES: List[str] = [
     "precipitation_hours",
     "wind_speed_10m_max",
     "wind_direction_10m_dominant",
+    "relative_humidity_2m_mean",
+    "pressure_msl_mean",
 ]
 
 # 20 full calendar years (2006-2025) to span multiple complete ENSO (El Niño / La Niña) cycles
@@ -166,12 +168,14 @@ def collect(
         for location, (latitude, longitude) in LOCATIONS.items():
             output_file = OUTPUT_DIR / f"{location}.json"
 
-            # Requirement: Do not re-download if file already exists for the target date range
+            # Requirement: Do not re-download if file already exists for the target date range and variables
             if output_file.exists() and not force_download:
                 try:
                     cached = json.loads(output_file.read_text(encoding="utf-8"))
-                    times = cached.get("daily", {}).get("time", [])
-                    if times and times[0] == start_date and times[-1] == end_date:
+                    daily_dict = cached.get("daily", {})
+                    times = daily_dict.get("time", [])
+                    has_all_vars = all(var in daily_dict for var in DAILY_VARIABLES)
+                    if times and times[0] == start_date and times[-1] == end_date and has_all_vars:
                         logging.info(
                             "[%s] Raw file already exists at %s (%s to %s), skipping download.",
                             location,

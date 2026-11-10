@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from typing import List
 
+import numpy as np
 import pandas as pd
 
 logging.basicConfig(
@@ -40,6 +41,8 @@ DAILY_VARIABLES = [
     "precipitation_hours",
     "wind_speed_10m_max",
     "wind_direction_10m_dominant",
+    "relative_humidity_2m_mean",
+    "pressure_msl_mean",
 ]
 
 
@@ -122,12 +125,55 @@ def create_final_dataset(df: pd.DataFrame, output_path: Path) -> pd.DataFrame:
     # The last day of each location has NaN for next_day_precip; identify and drop it
     last_day_mask = next_day_precip.isna()
     dropped_count = last_day_mask.sum()
-    final_df = df_sorted[~last_day_mask].reset_index(drop=True)
+    final_df = df_sorted[~last_day_mask].reset_index(drop=True).copy()
 
     logging.info(
         "Created 'RainTomorrow' target. Dropped %d last-day records without future labels.",
         dropped_count,
     )
+
+    # --- Section 4 Data Preparation Steps ---
+    # 4.2 Discretization (Numeric integer codes preserving order)
+    # 1. wind_speed_level (0: <19.5, 1: 19.5-28.5, 2: 28.5-38.5, 3: >=38.5 km/h)
+    final_df["wind_speed_level"] = pd.cut(
+        final_df["wind_speed_10m_max"],
+        bins=[-np.inf, 19.5, 28.5, 38.5, np.inf],
+        labels=[0, 1, 2, 3],
+    ).astype(int)
+
+    # 2. wind_dir_sector (8 compass sectors 0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW)
+    final_df["wind_dir_sector"] = (
+        ((final_df["wind_direction_10m_dominant"] + 22.5) % 360) // 45
+    ).astype(int)
+
+    # 4.3 Feature Engineering (Derived features from existing columns)
+    # 1. precip_intensity = precipitation_sum / precipitation_hours (0.0 when hours == 0)
+    final_df["precip_intensity"] = np.where(
+        final_df["precipitation_hours"] > 0,
+        (final_df["precipitation_sum"] / final_df["precipitation_hours"]).round(3),
+        0.0,
+    )
+
+    # 2. Hemisphere-adjusted season (0=Winter, 1=Spring, 2=Summer, 3=Autumn)
+    month = pd.to_datetime(final_df["date"]).dt.month
+    north_season_map = {
+        12: 0, 1: 0, 2: 0, 3: 1, 4: 1, 5: 1, 6: 2, 7: 2, 8: 2, 9: 3, 10: 3, 11: 3
+    }
+    south_season_map = {
+        12: 2, 1: 2, 2: 2, 3: 3, 4: 3, 5: 3, 6: 0, 7: 0, 8: 0, 9: 1, 10: 1, 11: 1
+    }
+    is_south = final_df["location"].str.lower() == "sydney"
+    final_df["season"] = np.where(
+        is_south, month.map(south_season_map), month.map(north_season_map)
+    ).astype(int)
+
+    # 4.1 Feature Selection (Drop the 2 redundant r=0.99 columns)
+    cols_to_drop = ["rain_sum", "apparent_temperature_mean"]
+    final_df.drop(columns=[c for c in cols_to_drop if c in final_df.columns], inplace=True)
+
+    # Ensure Target 'RainTomorrow' is the final column
+    feature_order = [c for c in final_df.columns if c != "RainTomorrow"] + ["RainTomorrow"]
+    final_df = final_df[feature_order]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     final_df.to_csv(output_path, index=False)

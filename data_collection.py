@@ -54,9 +54,10 @@ DAILY_VARIABLES: List[str] = [
     "wind_direction_10m_dominant",
 ]
 
-# Recommended date range: 5 full years gives ~1,826 daily records per city (10,956 rows total)
-START_DATE = "2020-01-01"
-END_DATE = "2024-12-31"
+# 20 full calendar years (2006-2025) to span multiple complete ENSO (El Niño / La Niña) cycles
+# (~7,305 daily records per city = 43,830 rows total across 6 cities)
+START_DATE = "2006-01-01"
+END_DATE = "2025-12-31"
 
 
 def wait_for_rate_limits(hourly_times: deque, daily_times: deque) -> None:
@@ -86,7 +87,7 @@ def fetch_with_retries(
     session: requests.Session,
     url: str,
     params: dict,
-    max_retries: int = 5,
+    max_retries: int = 8,
     backoff_factor: float = 2.0,
 ) -> dict:
     """
@@ -165,14 +166,22 @@ def collect(
         for location, (latitude, longitude) in LOCATIONS.items():
             output_file = OUTPUT_DIR / f"{location}.json"
 
-            # Requirement: Do not re-download if file already exists
+            # Requirement: Do not re-download if file already exists for the target date range
             if output_file.exists() and not force_download:
-                logging.info(
-                    "[%s] Raw file already exists at %s, skipping download.",
-                    location,
-                    output_file,
-                )
-                continue
+                try:
+                    cached = json.loads(output_file.read_text(encoding="utf-8"))
+                    times = cached.get("daily", {}).get("time", [])
+                    if times and times[0] == start_date and times[-1] == end_date:
+                        logging.info(
+                            "[%s] Raw file already exists at %s (%s to %s), skipping download.",
+                            location,
+                            output_file,
+                            start_date,
+                            end_date,
+                        )
+                        continue
+                except Exception:
+                    pass
 
             wait_for_rate_limits(hourly_times, daily_times)
 
@@ -201,7 +210,7 @@ def collect(
             logging.info("[%s] Saved successfully to %s", location, output_file)
 
             # Polite delay between calls
-            time.sleep(0.5)
+            time.sleep(1.5)
 
     logging.info("Data collection finished successfully.")
 

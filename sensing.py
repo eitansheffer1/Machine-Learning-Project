@@ -25,8 +25,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-RAW_DATA_DIR = Path("data/raw")
-PROCESSED_DATA_DIR = Path("data/processed")
+BASE_DIR = Path(__file__).resolve().parent
+RAW_DATA_DIR = BASE_DIR / "data" / "raw"
+PROCESSED_DATA_DIR = BASE_DIR / "data" / "processed"
 
 LOCATIONS = ["london", "berlin", "new_york", "tokyo", "sydney", "vancouver"]
 
@@ -107,51 +108,39 @@ def create_sensed_data(df: pd.DataFrame, output_path: Path) -> pd.DataFrame:
     return deduped_df
 
 
-def create_final_dataset(df: pd.DataFrame, output_path: Path) -> pd.DataFrame:
+def build_features(df_in: pd.DataFrame) -> pd.DataFrame:
     """
-    Sorts by location and date, calculates binary RainTomorrow target
-    based on next day's precipitation_sum >= 1.0 mm, drops the final day
-    for each location, and saves final_dataset.csv.
+    Applies Section 4 Data Preparation steps (safe against NaN/missing values):
+    - 4.2 Discretization: Adds integer-coded 'wind_speed_level' (0..3) and 'wind_dir_sector' (0..7)
+    - 4.3 Feature Engineering: Adds 'precip_intensity' (mm/h) and hemisphere-adjusted 'season' (0..3)
+    - 4.1 Feature Selection: Drops 'rain_sum' and 'apparent_temperature_mean' (r = 0.99 twins)
     """
-    # Sort chronologically within each location
-    df_sorted = df.sort_values(by=["location", "date"]).reset_index(drop=True).copy()
+    final_df = df_in.copy()
 
-    # Calculate tomorrow's precipitation using shift(-1) grouped by location
-    next_day_precip = df_sorted.groupby("location")["precipitation_sum"].shift(-1)
-
-    # RainTomorrow: 1 if tomorrow's precipitation >= 1.0 mm, else 0
-    df_sorted["RainTomorrow"] = (next_day_precip >= 1.0).astype(int)
-
-    # The last day of each location has NaN for next_day_precip; identify and drop it
-    last_day_mask = next_day_precip.isna()
-    dropped_count = last_day_mask.sum()
-    final_df = df_sorted[~last_day_mask].reset_index(drop=True).copy()
-
-    logging.info(
-        "Created 'RainTomorrow' target. Dropped %d last-day records without future labels.",
-        dropped_count,
-    )
-
-    # --- Section 4 Data Preparation Steps ---
-    # 4.2 Discretization (Numeric integer codes preserving order)
-    # 1. wind_speed_level (0: <19.5, 1: 19.5-28.5, 2: 28.5-38.5, 3: >=38.5 km/h)
+    # 4.2 Discretization (Nullable Int64 codes preserving order and surviving NaNs in Part B)
+    # 1. wind_speed_level (0: <=19.5, 1: 19.5-28.5, 2: 28.5-38.5, 3: >38.5 km/h)
     final_df["wind_speed_level"] = pd.cut(
         final_df["wind_speed_10m_max"],
         bins=[-np.inf, 19.5, 28.5, 38.5, np.inf],
         labels=[0, 1, 2, 3],
-    ).astype(int)
+    ).astype("Int64")
 
     # 2. wind_dir_sector (8 compass sectors 0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW)
     final_df["wind_dir_sector"] = (
-        ((final_df["wind_direction_10m_dominant"] + 22.5) % 360) // 45
-    ).astype(int)
+        (((final_df["wind_direction_10m_dominant"] + 22.5) % 360) // 45)
+    ).astype("Int64")
 
     # 4.3 Feature Engineering (Derived features from existing columns)
-    # 1. precip_intensity = precipitation_sum / precipitation_hours (0.0 when hours == 0)
+    # 1. precip_intensity = precipitation_sum / precipitation_hours (0.0 when hours == 0, NaN if inputs missing)
+    has_precip_inputs = final_df["precipitation_hours"].notna() & final_df["precipitation_sum"].notna()
     final_df["precip_intensity"] = np.where(
-        final_df["precipitation_hours"] > 0,
-        (final_df["precipitation_sum"] / final_df["precipitation_hours"]).round(3),
-        0.0,
+        ~has_precip_inputs,
+        np.nan,
+        np.where(
+            final_df["precipitation_hours"] > 0,
+            (final_df["precipitation_sum"] / final_df["precipitation_hours"]).round(3),
+            0.0,
+        ),
     )
 
     # 2. Hemisphere-adjusted season (0=Winter, 1=Spring, 2=Summer, 3=Autumn)
@@ -163,13 +152,64 @@ def create_final_dataset(df: pd.DataFrame, output_path: Path) -> pd.DataFrame:
         12: 2, 1: 2, 2: 2, 3: 3, 4: 3, 5: 3, 6: 0, 7: 0, 8: 0, 9: 1, 10: 1, 11: 1
     }
     is_south = final_df["location"].str.lower() == "sydney"
-    final_df["season"] = np.where(
-        is_south, month.map(south_season_map), month.map(north_season_map)
-    ).astype(int)
+    final_df["season"] = pd.Series(
+        np.where(is_south, month.map(south_season_map), month.map(north_season_map)),
+        index=final_df.index,
+    ).astype("Int64")
 
     # 4.1 Feature Selection (Drop the 2 redundant r=0.99 columns)
     cols_to_drop = ["rain_sum", "apparent_temperature_mean"]
     final_df.drop(columns=[c for c in cols_to_drop if c in final_df.columns], inplace=True)
+
+    return final_df
+
+
+def create_final_dataset(df: pd.DataFrame, output_path: Path) -> pd.DataFrame:
+    """
+    Sorts by location and date, verifies date continuity, calculates binary
+    RainTomorrow target based on next day's precipitation_sum >= 1.0 mm,
+    drops the final day for each location, applies feature preparation,
+    and saves final_dataset.csv.
+    """
+    # Sort chronologically within each location
+    df_sorted = df.sort_values(by=["location", "date"]).reset_index(drop=True).copy()
+
+    # Verify strict 1-day continuity per location (no missing dates in time series)
+    dates_dt = pd.to_datetime(df_sorted["date"])
+    date_diffs = dates_dt.groupby(df_sorted["location"]).diff().dt.days
+    gaps = date_diffs[date_diffs.notna() & (date_diffs != 1)]
+    if not gaps.empty:
+        raise ValueError(
+            f"Date continuity check failed: found {len(gaps)} gap(s) in consecutive dates!"
+        )
+    logging.info(
+        "Verified date continuity: 0 gaps across all %d locations.",
+        df_sorted["location"].nunique(),
+    )
+
+    # Calculate tomorrow's precipitation using shift(-1) grouped by location
+    next_day_precip = df_sorted.groupby("location")["precipitation_sum"].shift(-1)
+
+    # Identify strictly the final chronological day of each location
+    last_day_mask = df_sorted.groupby("location").cumcount(ascending=False) == 0
+
+    # RainTomorrow: 1 if tomorrow's precipitation >= 1.0 mm, 0 if < 1.0 mm, pd.NA if missing
+    df_sorted["RainTomorrow"] = pd.Series(pd.NA, index=df_sorted.index, dtype="Int64")
+    valid_next = next_day_precip.notna()
+    df_sorted.loc[valid_next, "RainTomorrow"] = (
+        next_day_precip[valid_next] >= 1.0
+    ).astype("Int64")
+
+    # Drop strictly the final day of each location (which has no next day in archive)
+    dropped_count = int(last_day_mask.sum())
+    final_df = df_sorted[~last_day_mask].reset_index(drop=True).copy()
+
+    logging.info(
+        "Created 'RainTomorrow' target. Dropped %d last-day records without future labels.",
+        dropped_count,
+    )
+
+    final_df = build_features(final_df)
 
     # Ensure Target 'RainTomorrow' is the final column
     feature_order = [c for c in final_df.columns if c != "RainTomorrow"] + ["RainTomorrow"]

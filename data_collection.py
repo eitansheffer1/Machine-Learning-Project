@@ -23,8 +23,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
+BASE_DIR = Path(__file__).resolve().parent
 ENDPOINT = "https://archive-api.open-meteo.com/v1/archive"
-OUTPUT_DIR = Path("data/raw")
+OUTPUT_DIR = BASE_DIR / "data" / "raw"
 
 # Rate limiting boundaries from assignment instructions
 HOURLY_LIMIT = 5_000
@@ -89,16 +90,24 @@ def fetch_with_retries(
     session: requests.Session,
     url: str,
     params: dict,
+    hourly_times: deque,
+    daily_times: deque,
     max_retries: int = 8,
     backoff_factor: float = 2.0,
-) -> dict:
+) -> Tuple[dict, bytes]:
     """
     Fetch data with exponential backoff on HTTP 429 and 5xx errors.
+    Counts every request attempt (including retries) against rate limits.
     Fails immediately with clear diagnostic on HTTP 400.
+    Returns (parsed_json_payload, raw_response_bytes).
     """
     attempt = 0
     while attempt < max_retries:
         attempt += 1
+        wait_for_rate_limits(hourly_times, daily_times)
+        now = time.time()
+        hourly_times.append(now)
+        daily_times.append(now)
         try:
             response = session.get(url, params=params, timeout=30)
             
@@ -127,7 +136,7 @@ def fetch_with_retries(
             if payload.get("error") is True or "daily" not in payload:
                 raise RuntimeError(f"Unexpected response structure: {payload}")
 
-            return payload
+            return payload, response.content
 
         except (requests.ConnectionError, requests.Timeout) as e:
             wait_time = backoff_factor ** attempt
@@ -187,8 +196,6 @@ def collect(
                 except Exception:
                     pass
 
-            wait_for_rate_limits(hourly_times, daily_times)
-
             params = {
                 "latitude": latitude,
                 "longitude": longitude,
@@ -199,18 +206,12 @@ def collect(
             }
 
             logging.info("[%s] Requesting data...", location)
-            payload = fetch_with_retries(session, ENDPOINT, params)
-
-            # Record call times for rate tracking
-            now = time.time()
-            hourly_times.append(now)
-            daily_times.append(now)
-
-            # Save raw unmodified JSON
-            output_file.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            _, raw_bytes = fetch_with_retries(
+                session, ENDPOINT, params, hourly_times, daily_times
             )
+
+            # Save raw unmodified JSON bytes exactly as received from API
+            output_file.write_bytes(raw_bytes)
             logging.info("[%s] Saved successfully to %s", location, output_file)
 
             # Polite delay between calls
